@@ -1,0 +1,1097 @@
+#!/usr/bin/env bash
+# bm - gestore di bookmarks da terminale
+#
+# Copyright (C) 2026 <Eugenio Adami>
+#
+# Questo programma è software libero: puoi ridistribuirlo e/o modificarlo
+# secondo i termini della GNU General Public License pubblicata dalla
+# Free Software Foundation, versione 3 della licenza o (a tua scelta)
+# qualsiasi versione successiva.
+#
+# Questo programma è distribuito nella speranza che sia utile, ma SENZA
+# ALCUNA GARANZIA; senza neppure la garanzia implicita di COMMERCIABILITÀ o
+# di IDONEITÀ PER UN PARTICOLARE SCOPO. Vedi la GNU General Public License
+# per maggiori dettagli.
+#
+# Dovresti aver ricevuto una copia della GNU General Public License insieme
+# a questo programma (file LICENSE). In caso contrario, vedi
+# <https://www.gnu.org/licenses/>.
+#
+# Database: una cartella di file .txt, un file per categoria.
+# Formato di ogni riga:  data|url|titolo|tag1,tag2
+
+set -euo pipefail
+
+BM_DIR="${BM_DIR:-$HOME/.segnalibri}"
+DEFAULT_CAT="generale"
+SEP="|"
+
+# Colori (disattivati se l'output non è un terminale)
+if [[ -t 1 ]]; then
+    C_NUM=$'\e[1;33m'; C_URL=$'\e[36m'; C_CAT=$'\e[1;35m'
+    C_TAG=$'\e[32m'; C_DIM=$'\e[2m'; C_RST=$'\e[0m'
+else
+    C_NUM=""; C_URL=""; C_CAT=""; C_TAG=""; C_DIM=""; C_RST=""
+fi
+
+die()  { echo "Errore: $*" >&2; exit 1; }
+info() { echo "$*"; }
+
+init_db() {
+    if [[ -e "$BM_DIR" && ! -d "$BM_DIR" ]]; then
+        die "'$BM_DIR' esiste già ma è un file, non una cartella.
+Non lo tocco. Scegli un'altra cartella per il database, ad esempio:
+    export BM_DIR=\"\$HOME/.segnalibri-bm\""
+    fi
+    mkdir -p "$BM_DIR" || die "impossibile creare la cartella '$BM_DIR'"
+}
+
+# Rimuove il separatore e gli a capo dai campi inseriti dall'utente
+clean() { printf '%s' "$1" | tr -d '\n\r' | tr '|' '/'; }
+
+# Nome categoria valido -> percorso file
+cat_file() {
+    local c="$1"
+    [[ "$c" =~ ^[A-Za-z0-9._-]+$ ]] || die "nome categoria non valido: '$c'"
+    echo "$BM_DIR/$c.txt"
+}
+
+# Elenca tutti i bookmark con indice globale:
+# indice<TAB>categoria<TAB>riga_nel_file<TAB>contenuto
+all_entries() {
+    shopt -s nullglob
+    local files=("$BM_DIR"/*.txt)
+    (( ${#files[@]} )) || return 0
+    awk '
+        FNR == 1 { c = FILENAME; sub(/^.*\//, "", c); sub(/\.txt$/, "", c) }
+        { sub(/\r$/, "") }
+        /^$/ || /^#/ { next }
+        { printf "%d\t%s\t%d\t%s\n", ++n, c, FNR, $0 }' "${files[@]}"
+}
+
+# Sostituisce / elimina la riga N di un file
+replace_line() {
+    local tmp; tmp="$(mktemp)"
+    T="$3" awk -v n="$2" 'NR == n { print ENVIRON["T"]; next } { print }' "$1" > "$tmp" \
+        && cat "$tmp" > "$1"
+    rm -f "$tmp"
+}
+delete_line() { sed -i "${2}d" "$1"; }
+
+# Trova un bookmark dato l'indice globale; imposta E_CAT E_LN E_LINE
+find_entry() {
+    local id="$1" row
+    [[ "$id" =~ ^[0-9]+$ ]] || die "indice non valido: '$id'"
+    row="$(all_entries | awk -F'\t' -v id="$id" '$1 == id')"
+    [[ -n "$row" ]] || die "nessun bookmark con indice $id"
+    IFS=$'\t' read -r _ E_CAT E_LN E_LINE <<< "$row"
+}
+
+print_entry() {
+    local id="$1" cat="$2" line="$3" date url title tags
+    IFS="$SEP" read -r date url title tags <<< "$line"
+    printf '%s%4s%s  %s\n' "$C_NUM" "$id" "$C_RST" "${title:-$url}"
+    printf '      %s%s%s\n' "$C_URL" "$url" "$C_RST"
+    printf '      %s[%s]%s' "$C_CAT" "$cat" "$C_RST"
+    [[ -n "$tags" ]] && printf ' %s#%s%s' "$C_TAG" "${tags//,/ #}" "$C_RST"
+    printf ' %s%s%s\n' "$C_DIM" "$date" "$C_RST"
+}
+
+print_rows() {
+    local id cat ln line found=0
+    while IFS=$'\t' read -r id cat ln line; do
+        print_entry "$id" "$cat" "$line"
+        found=1
+    done
+    [[ $found -eq 1 ]] || info "Nessun bookmark trovato."
+}
+
+# Prova a ricavare il titolo della pagina (se curl è disponibile)
+fetch_title() {
+    command -v curl >/dev/null || return 0
+    curl -sL --max-time 5 "$1" 2>/dev/null \
+        | tr '\n' ' ' \
+        | grep -oiE '<title[^>]*>[^<]*</title>' \
+        | head -n1 \
+        | sed -E 's/<[^>]+>//g; s/^[[:space:]]+//; s/[[:space:]]+$//' || true
+}
+
+# ---------------------------------------------------------------- comandi
+
+cmd_add() {
+    local url="" title="" cat="$DEFAULT_CAT" tags=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--titolo)    title="${2:?manca il titolo}"; shift 2 ;;
+            -c|--categoria) cat="${2:?manca la categoria}"; shift 2 ;;
+            -g|--tag)       tags="${2:?mancano i tag}"; shift 2 ;;
+            -*) die "opzione sconosciuta: $1" ;;
+            *)  url="$1"; shift ;;
+        esac
+    done
+    [[ -n "$url" ]] || die "uso: bm add URL [-t titolo] [-c categoria] [-g tag1,tag2]"
+    [[ "$url" =~ ^[a-zA-Z][a-zA-Z0-9+.-]*:// ]] || url="https://$url"
+
+    if all_entries | cut -f4 | cut -d"$SEP" -f2 | grep -qxF "$url"; then
+        die "l'URL è già presente: $url"
+    fi
+
+    [[ -n "$title" ]] || title="$(fetch_title "$url")"
+    tags="$(norm_tags "$tags")"
+
+    local f; f="$(cat_file "$cat")"
+    printf '%s%s%s%s%s%s%s\n' "$(date '+%Y-%m-%d')" "$SEP" "$(clean "$url")" \
+        "$SEP" "$(clean "$title")" "$SEP" "$tags" >> "$f"
+    info "Aggiunto in [$cat]: ${title:-$url}"
+}
+
+cmd_list() {
+    if [[ $# -gt 0 ]]; then
+        local c="$1"
+        [[ -f "$(cat_file "$c")" ]] || die "categoria inesistente: $c"
+        all_entries | awk -F'\t' -v c="$c" '$2 == c' | print_rows
+    else
+        all_entries | print_rows
+    fi
+}
+
+cmd_search() {
+    [[ $# -gt 0 ]] || die "uso: bm search TERMINE"
+    local term="$*"
+    all_entries | awk -F'\t' -v t="$term" 'index(tolower($4), tolower(t))' | print_rows
+}
+
+cmd_tag() {
+    [[ $# -gt 0 ]] || die "uso: bm tag NOME_TAG"
+    local t; t="$(echo "$1" | tr 'A-Z' 'a-z')"
+    all_entries | awk -F'\t' -v t="$t" '{
+        split($4, f, "|"); n = split(f[4], tg, ",")
+        for (i = 1; i <= n; i++) if (tg[i] == t) { print; break }
+    }' | print_rows
+}
+
+# "Linux, Cose di Linux ,linux" -> "linux,cose-di-linux" (minuscolo, senza doppioni)
+norm_tags() {
+    clean "$1" | tr 'A-Z' 'a-z' | tr ',' '\n' \
+        | sed -E 's/^[[:space:]#]+//; s/[[:space:]]+$//; s/[[:space:]]+/-/g' \
+        | awk 'NF && !seen[$0]++' | paste -sd, -
+}
+
+# Tutti i tag esistenti, in ordine alfabetico -> TAG_NAMES e TAG_COUNTS
+all_tags() {
+    TAG_NAMES=() TAG_COUNTS=()
+    local n t
+    while read -r n t; do TAG_NAMES+=("$t"); TAG_COUNTS+=("$n"); done < <(
+        all_entries | cut -f4 | cut -d"$SEP" -f4 | tr ',' '\n' | grep -v '^$' | sort | uniq -c)
+}
+
+# Riscrive il campo tag della riga di un bookmark
+set_tags() {   # file riga riga_attuale nuovi_tag
+    local date url title old
+    IFS="$SEP" read -r date url title old <<< "$3"
+    replace_line "$1" "$2" "$date$SEP$url$SEP$title$SEP$4"
+}
+
+cmd_tag_add() {
+    [[ $# -ge 2 ]] || die "uso: bm tag-add INDICE tag1[,tag2...]"
+    find_entry "$1"; shift
+    local old; old="$(cut -d"$SEP" -f4 <<< "$E_LINE")"
+    local new; new="$(norm_tags "$old,$*")"
+    set_tags "$(cat_file "$E_CAT")" "$E_LN" "$E_LINE" "$new"
+    info "Tag: ${new:-(nessuno)}"
+}
+
+cmd_tag_rm() {
+    [[ $# -ge 2 ]] || die "uso: bm tag-rm INDICE tag1[,tag2...]"
+    find_entry "$1"; shift
+    local old t new=""; old="$(cut -d"$SEP" -f4 <<< "$E_LINE")"
+    local rm=",$(norm_tags "$*"),"
+    IFS=, read -ra arr <<< "$old"
+    for t in "${arr[@]}"; do [[ "$rm" == *",$t,"* ]] || new+="${new:+,}$t"; done
+    set_tags "$(cat_file "$E_CAT")" "$E_LN" "$E_LINE" "$new"
+    info "Tag: ${new:-(nessuno)}"
+}
+
+cmd_tags() {
+    all_entries | cut -f4 | cut -d"$SEP" -f4 | tr ',' '\n' | grep -v '^$' \
+        | sort | uniq -c | sort -rn \
+        | awk -v c="$C_TAG" -v r="$C_RST" '{ printf "%5d  %s#%s%s\n", $1, c, $2, r }'
+}
+
+cmd_cats() {
+    shopt -s nullglob
+    local f n
+    for f in "$BM_DIR"/*.txt; do
+        n="$(grep -cvE '^(#|$)' "$f" || true)"
+        printf '%5d  %s%s%s\n' "$n" "$C_CAT" "$(basename "$f" .txt)" "$C_RST"
+    done
+}
+
+cmd_del() {
+    [[ $# -gt 0 ]] || die "uso: bm del INDICE"
+    find_entry "$1"
+    print_entry "$1" "$E_CAT" "$E_LINE"
+    read -r -p "Eliminare questo bookmark? [s/N] " ans
+    [[ "$ans" =~ ^[sSyY]$ ]] || { info "Annullato."; return; }
+    sed -i "${E_LN}d" "$(cat_file "$E_CAT")"
+    info "Eliminato."
+}
+
+cmd_open() {
+    [[ $# -gt 0 ]] || die "uso: bm open INDICE"
+    find_entry "$1"
+    local url; url="$(cut -d"$SEP" -f2 <<< "$E_LINE")"
+    if command -v xdg-open >/dev/null; then
+        xdg-open "$url" >/dev/null 2>&1 &
+        info "Apro: $url"
+    else
+        echo "$url"
+    fi
+}
+
+cmd_edit() {
+    [[ $# -gt 0 ]] || die "uso: bm edit INDICE"
+    find_entry "$1"
+    "${EDITOR:-nano}" "+$E_LN" "$(cat_file "$E_CAT")"
+}
+
+cmd_mv() {
+    [[ $# -eq 2 ]] || die "uso: bm mv INDICE CATEGORIA"
+    find_entry "$1"
+    local dest; dest="$(cat_file "$2")"
+    [[ "$E_CAT" != "$2" ]] || die "il bookmark è già in [$2]"
+    printf '%s\n' "$E_LINE" >> "$dest"
+    sed -i "${E_LN}d" "$(cat_file "$E_CAT")"
+    info "Spostato da [$E_CAT] a [$2]."
+}
+
+# Ordina alfabeticamente per titolo (o per indirizzo, se manca il titolo)
+# i bookmark di una categoria, o di tutte. I commenti restano in cima.
+sort_file() {
+    local f="$1" tmp
+    tmp="$(mktemp)"
+    {
+        grep '^#' "$f" || true
+        awk -F'|' '
+            { sub(/\r$/, "") }
+            /^$/ || /^#/ { next }
+            {
+                k = ($3 != "") ? $3 : $2
+                sub(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/(www\.)?/, "", k)
+                gsub(/\t/, " ", k)
+                gsub(/à|á|â|ä|ã|À|Á|Â|Ä|Ã/, "a", k); gsub(/è|é|ê|ë|È|É|Ê|Ë/, "e", k)
+                gsub(/ì|í|î|ï|Ì|Í|Î|Ï/, "i", k);     gsub(/ò|ó|ô|ö|õ|Ò|Ó|Ô|Ö|Õ/, "o", k)
+                gsub(/ù|ú|û|ü|Ù|Ú|Û|Ü/, "u", k);     gsub(/ç|Ç/, "c", k); gsub(/ñ|Ñ/, "n", k)
+                print tolower(k) "\t" $0
+            }' "$f" | LC_ALL=C sort -s -t$'\t' -k1,1 | cut -f2-
+    } > "$tmp" && cat "$tmp" > "$f"
+    rm -f "$tmp"
+}
+
+cmd_sort() {
+    shopt -s nullglob
+    local files=() f
+    if [[ $# -gt 0 ]]; then
+        f="$(cat_file "$1")"
+        [[ -f "$f" ]] || die "categoria inesistente: $1"
+        files=("$f")
+    else
+        files=("$BM_DIR"/*.txt)
+    fi
+    for f in "${files[@]}"; do sort_file "$f"; done
+    if [[ $# -gt 0 ]]; then info "Categoria [$1] ordinata alfabeticamente."
+    else info "Ordinate alfabeticamente ${#files[@]} categorie."; fi
+}
+
+cmd_check() {
+    command -v curl >/dev/null || die "serve curl per controllare i link"
+    local id cat ln line url code
+    while IFS=$'\t' read -r id cat ln line; do
+        url="$(cut -d"$SEP" -f2 <<< "$line")"
+        code="$(curl -sL -o /dev/null -w '%{http_code}' --max-time 10 "$url" || true)"
+        [[ "$code" =~ ^[23] ]] || printf '%s%4s%s  [%s] %s\n' "$C_NUM" "$id" "$C_RST" "$code" "$url"
+    done < <(all_entries)
+    info "Controllo terminato (mostrati solo i link non funzionanti)."
+}
+
+html_esc() {
+    local s="$1"
+    s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; s="${s//\"/&quot;}"
+    printf '%s' "$s"
+}
+
+cmd_export() {
+    local id cat ln line date url title tags epoch last=""
+    echo '<!DOCTYPE NETSCAPE-Bookmark-file-1>'
+    echo '<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">'
+    echo '<TITLE>Bookmarks</TITLE><H1>Bookmarks</H1><DL><p>'
+    while IFS=$'\t' read -r id cat ln line; do
+        IFS="$SEP" read -r date url title tags <<< "$line"
+        if [[ "$cat" != "$last" ]]; then
+            [[ -n "$last" ]] && echo '    </DL><p>'
+            echo "    <DT><H3>$cat</H3>"; echo '    <DL><p>'
+            last="$cat"
+        fi
+        epoch="$(date -d "$date" +%s 2>/dev/null || date +%s)"
+        echo "        <DT><A HREF=\"$(html_esc "$url")\" ADD_DATE=\"$epoch\" TAGS=\"$(html_esc "$tags")\">$(html_esc "${title:-$url}")</A>"
+    done < <(all_entries)
+    [[ -n "$last" ]] && echo '    </DL><p>'
+    echo '</DL><p>'
+}
+
+# Converte un nome di cartella del browser in un nome di categoria valido
+cat_name() {
+    local c
+    c="$(printf '%s' "$1" \
+        | sed -E 's/à|á|â|ä|ã|À|Á|Â|Ä|Ã/a/g; s/è|é|ê|ë|È|É|Ê|Ë/e/g; s/ì|í|î|ï|Ì|Í|Î|Ï/i/g;
+                  s/ò|ó|ô|ö|õ|Ò|Ó|Ô|Ö|Õ/o/g; s/ù|ú|û|ü|Ù|Ú|Û|Ü/u/g; s/ç|Ç/c/g; s/ñ|Ñ/n/g' \
+        | tr 'A-Z ' 'a-z_' | tr -cd 'a-z0-9._-')"
+    echo "${c:-$DEFAULT_CAT}"
+}
+
+# Il file è un export HTML dei browser?
+is_html() { grep -qiE '<a[[:space:]][^>]*href=' "$1"; }
+
+# Ogni parser stampa righe:  cartella \037 data \037 url \037 titolo \037 tag
+
+# HTML (formato Netscape: Firefox, Chrome, Edge, buku, ...)
+parse_html() {
+    awk '
+        function attr(s, name,   l, p, r) {
+            l = tolower(s)
+            p = index(l, " " name "=\"")
+            if (!p) return ""
+            r = substr(s, p + length(name) + 3)
+            return substr(r, 1, index(r, "\"") - 1)
+        }
+        function inner(s,   r) {
+            r = s
+            sub(/^.*<[Aa][^>]*>|^.*<[Hh]3[^>]*>/, "", r)
+            sub(/<\/.*$/, "", r)
+            return unent(r)
+        }
+        function unent(s) {
+            gsub(/&lt;/, "<", s); gsub(/&gt;/, ">", s); gsub(/&quot;/, "\"", s)
+            gsub(/&#39;/, "\047", s); gsub(/&amp;/, "\\&", s)
+            gsub(/\t/, " ", s)
+            return s
+        }
+        {
+            l = tolower($0)
+            if (l ~ /<h3/) { pending = inner($0) }
+            else if (l ~ /<a /) {
+                url = unent(attr($0, "href"))
+                if (url !~ /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//) next
+                f = ""
+                for (i = depth; i >= 1; i--) if (stack[i] != "") { f = stack[i]; break }
+                printf "%s\037%s\037%s\037%s\037%s\n", f, attr($0, "add_date"), url, inner($0), unent(attr($0, "tags"))
+            }
+            if (l ~ /<dl/)   { stack[++depth] = pending; pending = "" }
+            if (l ~ /<\/dl/) { if (depth > 0) depth-- }
+        }' "$1"
+}
+
+# Testo semplice: una riga per bookmark. Riconosce
+#   https://sito.it                      solo l'URL
+#   Titolo del sito https://sito.it      URL in qualsiasi punto della riga
+#   https://sito.it - Titolo             (il resto della riga diventa il titolo)
+#   www.sito.it                          anche senza https://
+#   [Titolo](https://sito.it)            link in stile Markdown
+#   data|url|titolo|tag                  il formato di bm
+#   [Nome categoria]                     le righe seguenti vanno in quella categoria
+# Le righe senza un indirizzo vengono ignorate.
+parse_text() {
+    awk '
+        function trim(s) {
+            gsub(/[ \t]+/, " ", s)
+            sub(/^[ \t\-|:;,>*•]+/, "", s); sub(/[ \t\-|:;,<]+$/, "", s)
+            return s
+        }
+        function out(u, t, d, g) { printf "%s\037%s\037%s\037%s\037%s\n", f, d, u, trim(t), g }
+        {
+            sub(/\r$/, ""); line = $0
+            gsub(/\t/, " ", line)
+            if (line ~ /^[ ]*\[[^]]+\][ ]*$/) {
+                f = line; sub(/^[ ]*\[/, "", f); sub(/\][ ]*$/, "", f); next
+            }
+            n = split(line, p, "|")
+            if (n >= 3 && p[2] ~ /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//) { out(p[2], p[3], p[1], p[4]); next }
+            if (match(line, /\[[^]]*\]\([a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^ ]+\)/)) {
+                md = substr(line, RSTART, RLENGTH)
+                t = md; sub(/^\[/, "", t); sub(/\]\(.*$/, "", t)
+                u = md; sub(/^.*\]\(/, "", u); sub(/\)$/, "", u)
+                out(u, t, "", ""); next
+            }
+            if (match(line, /[a-zA-Z][a-zA-Z0-9+.-]*:\/\/[^ "<>]+/)) {
+                u = substr(line, RSTART, RLENGTH)
+                out(u, substr(line, 1, RSTART - 1) " " substr(line, RSTART + RLENGTH), "", ""); next
+            }
+            if (match(line, /(^|[ ])www\.[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+[^ "<>]*/)) {
+                u = substr(line, RSTART, RLENGTH); sub(/^ /, "", u)
+                out("https://" u, substr(line, 1, RSTART - 1) " " substr(line, RSTART + RLENGTH), "", ""); next
+            }
+            if (line ~ /^[ ]*[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)*\.[a-zA-Z][a-zA-Z]+(\/[^ ]*)?[ ]*$/) {
+                u = line; gsub(/ /, "", u); out("https://" u, "", "", "")
+            }
+        }' "$1"
+}
+
+# Importa bookmark da un file HTML esportato dai browser o da un file di testo
+cmd_import() {
+    local file="" force_cat=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--categoria) force_cat="${2:?manca la categoria}"; shift 2 ;;
+            -*) die "opzione sconosciuta: $1" ;;
+            *)  file="$1"; shift ;;
+        esac
+    done
+    [[ -n "$file" ]] || die "uso: bm import FILE [-c categoria]"
+    [[ -f "$file" ]] || die "file non trovato: $file"
+    [[ -z "$force_cat" ]] || cat_file "$force_cat" >/dev/null
+
+    # URL già presenti, per saltare i duplicati
+    declare -A seen=()
+    local u
+    while IFS= read -r u; do
+        [[ -n "$u" ]] && seen["$u"]=1
+    done < <(all_entries | cut -f4 | cut -d"$SEP" -f2)
+
+    local added=0 skipped=0 folder epoch url title tags cat date
+    while IFS=$'\x1f' read -r folder epoch url title tags; do
+        if [[ -n "${seen[$url]:-}" ]]; then
+            skipped=$((skipped + 1)); continue
+        fi
+        seen["$url"]=1
+        cat="${force_cat:-$(cat_name "$folder")}"
+        if [[ "$epoch" =~ ^[0-9]+$ ]]; then
+            printf -v date '%(%Y-%m-%d)T' "$epoch"
+        elif [[ "$epoch" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            date="$epoch"
+        else
+            printf -v date '%(%Y-%m-%d)T' -1
+        fi
+        tags="$(norm_tags "$tags")"
+        printf '%s%s%s%s%s%s%s\n' "$date" "$SEP" "$(clean "$url")" \
+            "$SEP" "$(clean "$title")" "$SEP" "$tags" >> "$(cat_file "$cat")"
+        added=$((added + 1))
+    done < <(if is_html "$file"; then parse_html "$file"; else parse_text "$file"; fi)
+
+    info "Importati: $added   Saltati (già presenti): $skipped"
+}
+
+# ---------------------------------------------------------------- TUI
+
+T_CUR=""            # categoria mostrata ("" = tutte)
+T_FILTER=""         # testo di ricerca
+T_TAGF=""           # tag scelto con '#' ("" = nessuno)
+T_SEL=0 T_TOP=0     # riga selezionata / prima riga visibile
+T_MSG=""            # messaggio nella barra in basso
+T_REDRAW=1
+T_CATS=() T_CAT=() T_LN=() T_LINE=()
+T_CW=0 T_GW=0       # larghezza massima di nome e tag nell'elenco
+declare -A T_COUNT=()
+
+S_BAR=$'\e[0;30;46m'; S_SEL=$'\e[0;1;7m'; S_CATON=$'\e[0;1;30;43m'
+S_HEAD=$'\e[0;1m'
+# colore della prima colonna: cambialo con BM_COLORE_NOMI (codice ANSI, es. 97 = bianco, 93 = giallo)
+S_CATCOL=$'\e[0;'"${BM_COLORE_NOMI:-95}"'m'
+S_URL=$'\e[0;36m'; S_DIM=$'\e[0;2m'; S_TAG=$'\e[0;32m'; S_MSG=$'\e[0;1;33m'; S_RST=$'\e[0m'
+
+# Tronca o riempie di spazi un testo fino a W caratteri -> FIT
+fit() {
+    local s="$1" w="$2"
+    (( w < 1 )) && { FIT=""; return; }
+    (( ${#s} > w )) && s="${s:0:w-1}…"
+    printf -v FIT '%s%*s' "$s" $((w - ${#s})) ""
+}
+
+tui_load() {
+    local f id cat ln line tg
+    shopt -s nullglob
+    T_CATS=("")
+    for f in "$BM_DIR"/*.txt; do T_CATS+=("$(basename "$f" .txt)"); done
+    [[ -z "$T_CUR" || -f "$BM_DIR/$T_CUR.txt" ]] || T_CUR=""
+    T_CAT=() T_LN=() T_LINE=() T_COUNT=()
+    T_CW=0 T_GW=0
+    while IFS=$'\t' read -r id cat ln line; do
+        T_COUNT[$cat]=$(( ${T_COUNT[$cat]:-0} + 1 ))
+        T_COUNT[_all_]=$(( ${T_COUNT[_all_]:-0} + 1 ))
+        [[ -n "$T_CUR" && "$cat" != "$T_CUR" ]] && continue
+        [[ -n "$T_FILTER" && "${line,,}" != *"${T_FILTER,,}"* ]] && continue
+        if [[ -n "$T_TAGF" ]]; then
+            tg="${line#*"$SEP"*"$SEP"*"$SEP"}"
+            [[ ",${tg%%"$SEP"*}," == *",$T_TAGF,"* ]] || continue
+        fi
+        T_CAT+=("$cat") T_LN+=("$ln") T_LINE+=("$line")
+        tg="${line#*"$SEP"*"$SEP"}"; tg="${tg%%"$SEP"*}"
+        [[ -n "$tg" ]] || { tg="${line#*"$SEP"}"; tg="${tg%%"$SEP"*}"; tg="${tg#*://}"; tg="${tg%/}"; }
+        (( ${#tg} > T_CW )) && T_CW=${#tg}
+        tg="${line#*"$SEP"*"$SEP"*"$SEP"}"; tg="${tg%%"$SEP"*}"
+        [[ -n "$tg" ]] && tg="#${tg//,/ #}"
+        (( ${#tg} > T_GW )) && T_GW=${#tg}
+    done < <(all_entries)
+    (( T_SEL >= ${#T_LINE[@]} )) && T_SEL=$(( ${#T_LINE[@]} - 1 ))
+    (( T_SEL < 0 )) && T_SEL=0
+    return 0
+}
+
+tui_draw() {
+    local rows cols
+    read -r rows cols < <(stty size)
+    local list_h=$(( rows - 9 )) n=${#T_LINE[@]}
+    (( list_h < 1 )) && list_h=1
+    (( T_SEL < T_TOP )) && T_TOP=$T_SEL
+    (( T_SEL >= T_TOP + list_h )) && T_TOP=$(( T_SEL - list_h + 1 ))
+    (( T_TOP < 0 )) && T_TOP=0
+
+    local out="" i r name label used date url title tags u uw cw gw c g avail
+    (( T_REDRAW )) && out+=$'\e[2J' && T_REDRAW=0
+
+    # riga 1: titolo e percorso del database
+    fit " BOOKMARKS   ·   database: ${BM_DIR/#$HOME/\~}/<categoria>.txt" "$cols"
+    out+=$'\e[1;1H'"$S_BAR$FIT$S_RST"
+
+    # riga 2: categorie (←/→ per cambiare)
+    local ci=0
+    for i in "${!T_CATS[@]}"; do [[ "${T_CATS[$i]}" == "$T_CUR" ]] && ci=$i; done
+    local labels=()
+    for name in "${T_CATS[@]}"; do
+        labels+=(" ${name:-Tutte} (${T_COUNT[${name:-_all_}]:-0}) ")
+    done
+    local start=0 width
+    while :; do
+        width=0
+        for (( i = start; i <= ci; i++ )); do width=$(( width + ${#labels[i]} + 1 )); done
+        (( width + 4 > cols && start < ci )) || break
+        start=$(( start + 1 ))
+    done
+    out+=$'\e[2;1H\e[K'
+    used=0
+    if (( start > 0 )); then out+="$S_DIM‹$S_RST"; used=1; fi
+    for (( i = start; i < ${#labels[@]}; i++ )); do
+        (( used + ${#labels[i]} + 2 > cols )) && { out+="$S_DIM›$S_RST"; break; }
+        if (( i == ci )); then out+="$S_CATON${labels[i]}$S_RST "
+        else out+="${labels[i]} "; fi
+        used=$(( used + ${#labels[i]} + 1 ))
+    done
+    if [[ -n "$T_FILTER" || -n "$T_TAGF" ]]; then
+        out+=$'\e[3;1H\e[K'"$S_MSG"
+        [[ -n "$T_TAGF" ]] && out+=" Tag: #$T_TAGF "
+        [[ -n "$T_FILTER" ]] && out+=" Ricerca: \"$T_FILTER\" "
+        out+="$S_RST$S_DIM  (Esc per togliere il filtro)$S_RST"
+    else
+        out+=$'\e[3;1H\e[K'
+    fi
+
+    # larghezza delle colonne: CATEGORIA (nome del bookmark)  TAGS  URL
+    avail=$(( cols - 6 ))
+    cw=$(( T_CW < 9 ? 9 : T_CW ));  (( cw > avail * 40 / 100 )) && cw=$(( avail * 40 / 100 ))
+    gw=$(( T_GW < 4 ? 4 : T_GW ));  (( gw > avail * 30 / 100 )) && gw=$(( avail * 30 / 100 ))
+    uw=$(( avail - cw - gw ))
+
+    # riga 4: titoli delle colonne, riga 5: separatore
+    fit "CATEGORIA" "$cw"; c="$FIT"; fit "TAGS" "$gw"; g="$FIT"; fit "URL" "$uw"; u="$FIT"
+    out+=$'\e[4;1H'"$S_HEAD ${c}  ${g}  ${u} $S_RST"
+    fit "" "$cols"; out+=$'\e[5;1H'"$S_DIM${FIT// /_}$S_RST"
+
+    # lista
+    for (( r = 0; r < list_h; r++ )); do
+        i=$(( T_TOP + r ))
+        out+=$'\e['"$(( 6 + r ))"$';1H'
+        if (( i < n )); then
+            IFS="$SEP" read -r date url title tags <<< "${T_LINE[i]}"
+            u="${url#*://}"; u="${u%/}"
+            [[ -n "$tags" ]] && tags="#${tags//,/ #}"
+            fit "${title:-$u}" "$cw"; c="$FIT"
+            fit "$tags" "$gw"; g="$FIT"
+            fit "$u" "$uw"; u="$FIT"
+            if (( i == T_SEL )); then out+="$S_SEL ${c}  ${g}  ${u} $S_RST"
+            else out+=" $S_CATCOL${c}$S_RST  $S_TAG${g}$S_RST  $S_URL${u}$S_RST "; fi
+        else
+            out+=$'\e[K'
+        fi
+    done
+
+    # dettagli del bookmark selezionato
+    fit "" "$cols"; out+=$'\e['$(( rows - 3 ))';1H'"$S_DIM${FIT// /─}$S_RST"
+    out+=$'\e['"$(( rows - 2 ))"$';1H\e[K'
+    if (( n > 0 )); then
+        IFS="$SEP" read -r date url title tags <<< "${T_LINE[T_SEL]}"
+        fit " ${title:-(senza nome)}" "$(( cols - ${#T_CAT[T_SEL]} - 16 ))"; out+="$S_HEAD$FIT$S_RST"
+        out+="$S_DIM  file: ${T_CAT[T_SEL]}.txt$S_RST"
+        out+=$'\e['"$(( rows - 1 ))"$';1H\e[K'
+        fit " $url" "$(( cols - 24 ))"; out+="$S_URL$FIT$S_RST"
+        out+="$S_DIM  $date  ($(( T_SEL + 1 ))/$n)$S_RST"
+    else
+        out+="$S_DIM Nessun bookmark. Premi 'a' per aggiungerne uno.$S_RST"
+        out+=$'\e['"$(( rows - 1 ))"$';1H\e[K'
+    fi
+
+    # barra in basso: messaggio o tasti
+    out+=$'\e['"$rows"';1H'
+    if [[ -n "$T_MSG" ]]; then
+        fit " ${T_MSG//$'\n'/ — }" "$cols"; out+="$S_MSG$FIT$S_RST"; T_MSG=""
+    else
+        fit " F1 ? aiuto │ ↑↓←→ muovi  Invio apri  a nuovo  t tag  # filtra tag  e modifica  d elimina  / cerca  q esci" "$cols"
+        out+="$S_BAR$FIT$S_RST"
+    fi
+    printf '%s' "$out"
+}
+
+# Legge un tasto -> K (UP DOWN LEFT RIGHT PGUP PGDN HOME END ENTER ESC o il carattere)
+tui_key() {
+    local k s t
+    IFS= read -rsn1 k || { K=q; return; }
+    if [[ "$k" == $'\e' ]]; then
+        IFS= read -rsn1 -t 0.05 s || s=""
+        if [[ "$s" == "[" || "$s" == "O" ]]; then
+            IFS= read -rsn1 -t 0.05 k || k=""
+            case "$k" in
+                A) K=UP ;; B) K=DOWN ;; C) K=RIGHT ;; D) K=LEFT ;; H) K=HOME ;; F) K=END ;;
+                P) K=F1 ;;
+                [0-9])
+                    # sequenze tipo ESC [ 5 ~  oppure  ESC [ 1 1 ~
+                    while IFS= read -rsn1 -t 0.05 t && [[ "$t" == [0-9\;] ]]; do k+="$t"; done
+                    case "$k" in
+                        5) K=PGUP ;; 6) K=PGDN ;; 1|7) K=HOME ;; 4|8) K=END ;; 3) K=DEL ;;
+                        11) K=F1 ;; *) K="" ;;
+                    esac ;;
+                \[) IFS= read -rsn1 -t 0.05 t || t=""; [[ "$t" == A ]] && K=F1 || K="" ;;  # console Linux
+                *) K="" ;;
+            esac
+        else
+            K=ESC
+        fi
+    elif [[ -z "$k" ]]; then K=ENTER
+    else K="$k"; fi
+}
+
+# Chiede un testo nella barra in basso -> REPLY_T (ritorna 1 se annullato con Ctrl+D)
+tui_prompt() {
+    local rows cols
+    read -r rows cols < <(stty size)
+    printf '\e[%d;1H\e[K%s' "$rows" "$S_RST"
+    stty echo; tput cnorm
+    local rc=0
+    IFS= read -e -r -p "$1" -i "${2:-}" REPLY_T || rc=1
+    stty -echo; tput civis
+    T_REDRAW=1
+    return $rc
+}
+
+tui_status() {
+    local rows cols
+    read -r rows cols < <(stty size)
+    fit " $1" "$cols"
+    printf '\e[%d;1H%s%s%s' "$rows" "$S_MSG" "$FIT" "$S_RST"
+}
+
+tui_confirm() {
+    tui_status "$1 [s/N]"
+    tui_key
+    [[ "$K" == [sSyY] ]]
+}
+
+tui_cur() {
+    (( ${#T_LINE[@]} > 0 )) || { T_MSG="Nessun bookmark selezionato."; return 1; }
+    IFS="$SEP" read -r B_DATE B_URL B_TITLE B_TAGS <<< "${T_LINE[T_SEL]}"
+    B_CAT="${T_CAT[T_SEL]}" B_LN="${T_LN[T_SEL]}"
+}
+
+tui_add() {
+    tui_prompt "URL (vuoto = annulla): " || return 0
+    local url="$REPLY_T"; [[ -n "$url" ]] || return 0
+    tui_prompt "Titolo (vuoto = lo prende dalla pagina): " || return 0
+    local title="$REPLY_T"
+    tui_prompt "Categoria: " "${T_CUR:-$DEFAULT_CAT}" || return 0
+    local cat="${REPLY_T:-$DEFAULT_CAT}"
+    tui_prompt "Tag (separati da virgola): " || return 0
+    local tags="$REPLY_T"
+    tui_status "Salvataggio…"
+    local args=("$url" -c "$cat")
+    [[ -n "$title" ]] && args+=(-t "$title")
+    [[ -n "$tags" ]] && args+=(-g "$tags")
+    T_MSG="$( (cmd_add "${args[@]}") 2>&1 )"
+}
+
+tui_edit() {
+    tui_cur || return 0
+    tui_prompt "URL: " "$B_URL" || return 0
+    [[ -n "$REPLY_T" ]] || return 0
+    local url="$REPLY_T"
+    tui_prompt "Titolo: " "$B_TITLE" || return 0
+    local title="$REPLY_T"
+    tui_prompt "Tag: " "$B_TAGS" || return 0
+    local tags; tags="$(norm_tags "$REPLY_T")"
+    replace_line "$BM_DIR/$B_CAT.txt" "$B_LN" \
+        "$B_DATE$SEP$(clean "$url")$SEP$(clean "$title")$SEP$tags"
+    T_MSG="Bookmark modificato."
+}
+
+tui_move() {
+    tui_cur || return 0
+    tui_prompt "Sposta in categoria (esistenti: ${T_CATS[*]:1}): " "$B_CAT" || return 0
+    local dest="$REPLY_T"
+    [[ -n "$dest" && "$dest" != "$B_CAT" ]] || return 0
+    [[ "$dest" =~ ^[A-Za-z0-9._-]+$ ]] || { T_MSG="Nome categoria non valido: $dest"; return 0; }
+    printf '%s\n' "${T_LINE[T_SEL]}" >> "$BM_DIR/$dest.txt"
+    delete_line "$BM_DIR/$B_CAT.txt" "$B_LN"
+    T_MSG="Spostato in [$dest]."
+}
+
+tui_delete() {
+    tui_cur || return 0
+    if tui_confirm "Eliminare «${B_TITLE:-$B_URL}»?"; then
+        delete_line "$BM_DIR/$B_CAT.txt" "$B_LN"
+        T_MSG="Eliminato."
+    else
+        T_MSG="Annullato."
+    fi
+}
+
+# Schermata con l'elenco dei tag.
+#   $1 = edit    spunta/togli i tag del bookmark selezionato (n = nuovo tag)
+#   $1 = filter  sceglie un tag con cui filtrare l'elenco
+tui_tag_picker() {
+    local mode="$1" t i found
+    local -a cur=() added=() arr=()
+    declare -A on=()
+    if [[ "$mode" == edit ]]; then
+        tui_cur || return 0
+        IFS=, read -ra cur <<< "$B_TAGS"
+        for t in "${cur[@]}"; do [[ -n "$t" ]] && on[$t]=1; done
+    fi
+    all_tags
+    local -a names=("${TAG_NAMES[@]}") counts=("${TAG_COUNTS[@]}")
+    local sel=0 top=0 rows cols h n r out label mark changed=0 head first
+    if [[ "$mode" == edit ]]; then
+        first="+ nuovo tag…"
+        head=" TAG di «${B_TITLE:-$B_URL}»  ·  Spazio/Invio aggiunge o toglie  ·  n nuovo  ·  q/Esc salva ed esce"
+    else
+        first="(nessun filtro: mostra tutti)"
+        head=" FILTRA PER TAG  ·  ↑↓ scegli  ·  Invio conferma  ·  Esc annulla"
+        for i in "${!names[@]}"; do [[ "${names[i]}" == "$T_TAGF" ]] && sel=$(( i + 1 )); done
+    fi
+    printf '\e[2J'
+    while :; do
+        read -r rows cols < <(stty size)
+        n=$(( ${#names[@]} + 1 ))
+        h=$(( rows - 4 )); (( h < 1 )) && h=1
+        (( sel < 0 )) && sel=0
+        (( sel >= n )) && sel=$(( n - 1 ))
+        (( sel < top )) && top=$sel
+        (( sel >= top + h )) && top=$(( sel - h + 1 ))
+        fit "$head" "$cols"; out=$'\e[1;1H'"$S_BAR$FIT$S_RST"
+        out+=$'\e[2;1H\e[K'
+        if [[ "$mode" == edit ]]; then
+            label=""
+            for t in "${cur[@]}" "${added[@]}" "${names[@]}"; do
+                [[ -n "$t" && -n "${on[$t]:-}" && "$label " != *" #$t "* ]] && label+=" #$t"
+            done
+            out+=" Tag attuali:$S_TAG${label:- (nessuno)}$S_RST"
+        fi
+        for (( r = 0; r < h; r++ )); do
+            i=$(( top + r ))
+            out+=$'\e['"$(( r + 3 ))"$';1H'
+            if (( i >= n )); then out+=$'\e[K'; continue; fi
+            if (( i == 0 )); then label="  $first"
+            else
+                t="${names[i-1]}"
+                if [[ "$mode" == edit ]]; then
+                    [[ -n "${on[$t]:-}" ]] && mark="[x]" || mark="[ ]"
+                    label="  $mark #$t  (${counts[i-1]})"
+                else
+                    label="  #$t  (${counts[i-1]})"
+                fi
+            fi
+            fit "$label" "$cols"
+            if (( i == sel )); then out+="$S_SEL$FIT$S_RST"; else out+="$FIT"; fi
+        done
+        out+=$'\e['"$(( rows - 1 ))"$';1H\e[K'
+        fit " ${#names[@]} tag in tutto" "$cols"
+        out+=$'\e['"$rows"$';1H'"$S_DIM$FIT$S_RST"
+        printf '%s' "$out"
+
+        tui_key
+        case "$K" in
+            UP|k)   sel=$(( sel - 1 )) ;;
+            DOWN|j) sel=$(( sel + 1 )) ;;
+            PGUP)   sel=$(( sel - h )) ;;
+            PGDN)   sel=$(( sel + h )) ;;
+            HOME|g) sel=0 ;;
+            END|G)  sel=$(( n - 1 )) ;;
+            ESC|q|Q)
+                break ;;
+            n|N|" "|ENTER)
+                if [[ "$mode" == filter ]]; then
+                    [[ "$K" == ENTER || "$K" == " " ]] || continue
+                    if (( sel == 0 )); then T_TAGF=""; else T_TAGF="${names[sel-1]}"; fi
+                    T_SEL=0; T_TOP=0
+                    break
+                fi
+                if [[ "$K" == n || "$K" == N ]] || (( sel == 0 )); then
+                    tui_prompt "Nuovi tag (separati da virgola): " || { printf '\e[2J'; continue; }
+                    printf '\e[2J'
+                    t="$(norm_tags "$REPLY_T")"
+                    [[ -n "$t" ]] || continue
+                    IFS=, read -ra arr <<< "$t"
+                    for t in "${arr[@]}"; do
+                        on[$t]=1; changed=1
+                        [[ " ${added[*]} " == *" $t "* ]] || added+=("$t")
+                        found=0
+                        for i in "${!names[@]}"; do [[ "${names[i]}" == "$t" ]] && found=1; done
+                        (( found )) || { names+=("$t"); counts+=(0); }
+                    done
+                else
+                    t="${names[sel-1]}"
+                    if [[ -n "${on[$t]:-}" ]]; then unset "on[$t]"; else on[$t]=1; fi
+                    changed=1
+                fi ;;
+        esac
+    done
+    T_REDRAW=1
+    if [[ "$mode" == edit ]] && (( changed )); then
+        label=""
+        for t in "${cur[@]}" "${added[@]}" "${names[@]}"; do
+            [[ -n "$t" && -n "${on[$t]:-}" && ",$label," != *",$t,"* ]] && label+="${label:+,}$t"
+        done
+        set_tags "$BM_DIR/$B_CAT.txt" "$B_LN" "${T_LINE[T_SEL]}" "$label"
+        T_MSG="Tag salvati: ${label:-(nessuno)}"
+    fi
+    return 0
+}
+
+tui_sort() {
+    local what="tutte le categorie"
+    [[ -n "$T_CUR" ]] && what="la categoria [$T_CUR]"
+    tui_confirm "Ordinare alfabeticamente $what?" || { T_MSG="Annullato."; return 0; }
+    if [[ -n "$T_CUR" ]]; then T_MSG="$( (cmd_sort "$T_CUR") 2>&1 )"
+    else T_MSG="$( (cmd_sort) 2>&1 )"; fi
+    T_SEL=0; T_TOP=0
+}
+
+tui_open() {
+    tui_cur || return 0
+    if command -v xdg-open >/dev/null; then
+        setsid xdg-open "$B_URL" >/dev/null 2>&1 < /dev/null &
+        T_MSG="Apro: $B_URL"
+    else
+        T_MSG="xdg-open non disponibile. URL: $B_URL"
+    fi
+}
+
+tui_copy() {
+    tui_cur || return 0
+    if command -v wl-copy >/dev/null; then printf '%s' "$B_URL" | wl-copy
+    elif command -v xclip >/dev/null; then printf '%s' "$B_URL" | xclip -selection clipboard
+    elif command -v xsel >/dev/null; then printf '%s' "$B_URL" | xsel -b
+    else T_MSG="Installa wl-clipboard, xclip o xsel per copiare."; return 0; fi
+    T_MSG="URL copiato negli appunti."
+}
+
+tui_import() {
+    tui_prompt "File da importare, .html o .txt (Tab completa il percorso): " "$HOME/" || return 0
+    [[ -n "$REPLY_T" ]] || return 0
+    tui_status "Importazione…"
+    T_MSG="$( (cmd_import "$REPLY_T") 2>&1 )"
+}
+
+tui_export() {
+    tui_prompt "Esporta in: " "$HOME/bookmarks.html" || return 0
+    [[ -n "$REPLY_T" ]] || return 0
+    if cmd_export > "$REPLY_T" 2>/dev/null; then T_MSG="Esportato in $REPLY_T"
+    else T_MSG="Impossibile scrivere $REPLY_T"; fi
+}
+
+# Aiuto in linea (F1, ? o h): tasti della TUI e comandi da terminale, scorrevole
+tui_help() {
+    local lines=() l
+    mapfile -t lines <<EOF
+${S_MSG}TASTI DELL'INTERFACCIA${S_RST}
+
+  Movimento
+    ↑ ↓   oppure  k j          muove la selezione
+    PagSu PagGiù               pagina precedente / successiva
+    Home Fine  oppure  g G     primo / ultimo bookmark
+    ← →   oppure  Tab          cambia categoria ("Tutte" mostra tutto)
+
+  Azioni sul bookmark selezionato
+    Invio  oppure  o           apre nel browser
+    y                          copia l'URL negli appunti
+    t                          aggiunge / toglie tag (scelta da elenco)
+    e                          modifica URL, titolo e tag
+    m                          sposta in un'altra categoria
+    d  oppure  Canc            elimina (chiede conferma)
+
+  Altro
+    a                          aggiunge un nuovo bookmark
+    /                          cerca in titolo, URL e tag
+    #                          mostra solo i bookmark con un certo tag
+    Esc                        toglie ricerca e filtro per tag
+    i                          importa da un file .html del browser o da un .txt
+    x                          esporta tutti i bookmark in HTML
+    s                          ordina alfabeticamente la categoria mostrata
+                               (in "Tutte" ordina ogni categoria)
+    r                          ricarica i file da disco
+    F1  oppure  ?  oppure  h   mostra questo aiuto
+    q                          esce
+
+  Nei campi di testo: Invio conferma, Ctrl+D annulla, Tab completa i percorsi.
+
+${S_MSG}COMANDI DA TERMINALE${S_RST}
+
+EOF
+    while IFS= read -r l; do lines+=("  $l"); done < <(usage)
+    lines+=("" "${S_MSG}DOVE SONO SALVATI I DATI${S_RST}" ""
+            "  Cartella:  $BM_DIR/"
+            "  Un file .txt per ogni categoria, una riga per ogni bookmark:"
+            "      data|url|titolo|tag1,tag2")
+
+    local top=0 rows cols h r out max
+    while :; do
+        read -r rows cols < <(stty size)
+        h=$(( rows - 2 )); (( h < 1 )) && h=1
+        max=$(( ${#lines[@]} - h )); (( max < 0 )) && max=0
+        (( top > max )) && top=$max
+        (( top < 0 )) && top=0
+        fit " AIUTO   ·   ↑↓ PagSu PagGiù scorri   ·   q / Esc / F1 torna all'elenco" "$cols"
+        out=$'\e[1;1H'"$S_BAR$FIT$S_RST"
+        for (( r = 0; r < h; r++ )); do
+            out+=$'\e['"$(( r + 2 ))"$';1H\e[K'"${lines[top + r]:-}$S_RST"
+        done
+        fit " righe $(( top + 1 ))-$(( top + h < ${#lines[@]} ? top + h : ${#lines[@]} )) di ${#lines[@]}" "$cols"
+        out+=$'\e['"$rows"$';1H'"$S_DIM$FIT$S_RST"
+        printf '%s' "$out"
+        tui_key
+        case "$K" in
+            UP|k)   top=$(( top - 1 )) ;;
+            DOWN|j) top=$(( top + 1 )) ;;
+            PGUP)   top=$(( top - h )) ;;
+            PGDN|" ") top=$(( top + h )) ;;
+            HOME|g) top=0 ;;
+            END|G)  top=$max ;;
+            q|Q|ESC|F1|\?|h|ENTER) break ;;
+        esac
+    done
+    T_REDRAW=1
+}
+
+tui_cleanup() {
+    stty echo 2>/dev/null || true
+    tput cnorm 2>/dev/null || true
+    tput rmcup 2>/dev/null || true
+}
+
+tui() {
+    [[ -t 0 && -t 1 ]] || die "la TUI richiede un terminale (usa 'bm list')"
+    set +e
+    tput smcup; tput civis; stty -echo
+    trap tui_cleanup EXIT
+    trap 'exit 130' INT TERM
+    trap 'T_REDRAW=1' WINCH
+    tui_load
+    local rows cols page i
+    while :; do
+        tui_draw
+        tui_key
+        read -r rows cols < <(stty size)
+        page=$(( rows - 10 )); (( page < 1 )) && page=1
+        case "$K" in
+            UP|k)     (( T_SEL > 0 )) && T_SEL=$(( T_SEL - 1 )) ;;
+            DOWN|j)   (( T_SEL < ${#T_LINE[@]} - 1 )) && T_SEL=$(( T_SEL + 1 )) ;;
+            PGUP)     T_SEL=$(( T_SEL - page )); (( T_SEL < 0 )) && T_SEL=0 ;;
+            PGDN)     T_SEL=$(( T_SEL + page )); (( T_SEL >= ${#T_LINE[@]} )) && T_SEL=$(( ${#T_LINE[@]} - 1 )); (( T_SEL < 0 )) && T_SEL=0 ;;
+            HOME|g)   T_SEL=0 ;;
+            END|G)    T_SEL=$(( ${#T_LINE[@]} - 1 )); (( T_SEL < 0 )) && T_SEL=0 ;;
+            LEFT|RIGHT|$'\t')
+                for i in "${!T_CATS[@]}"; do [[ "${T_CATS[$i]}" == "$T_CUR" ]] && break; done
+                if [[ "$K" == LEFT ]]; then i=$(( (i - 1 + ${#T_CATS[@]}) % ${#T_CATS[@]} ))
+                else i=$(( (i + 1) % ${#T_CATS[@]} )); fi
+                T_CUR="${T_CATS[$i]}"; T_SEL=0; T_TOP=0; tui_load ;;
+            ENTER|o)  tui_open ;;
+            y)        tui_copy ;;
+            a)        tui_add; tui_load ;;
+            e)        tui_edit; tui_load ;;
+            m)        tui_move; tui_load ;;
+            d|DEL)    tui_delete; tui_load ;;
+            /)        tui_prompt "Cerca: " "$T_FILTER" && { T_FILTER="$REPLY_T"; T_SEL=0; T_TOP=0; tui_load; } ;;
+            ESC)      [[ -n "$T_FILTER$T_TAGF" ]] && { T_FILTER=""; T_TAGF=""; T_SEL=0; T_TOP=0; tui_load; } ;;
+            t)        tui_tag_picker edit; tui_load ;;
+            \#)       tui_tag_picker filter; tui_load ;;
+            i)        tui_import; tui_load ;;
+            x)        tui_export ;;
+            s)        tui_sort; tui_load ;;
+            r)        tui_load; T_REDRAW=1; T_MSG="Ricaricato." ;;
+            F1|\?|h)  tui_help ;;
+            q|Q)      break ;;
+        esac
+    done
+}
+
+usage() {
+    cat <<EOF
+bm - gestore di bookmarks (database: $BM_DIR/*.txt)
+
+Uso: bm                    apre l'interfaccia interattiva (TUI)
+     bm COMANDO [argomenti]
+
+  add URL [-t titolo] [-c categoria] [-g tag1,tag2]   aggiunge un bookmark
+  list [categoria]          elenca i bookmark (tutti o di una categoria)
+  search TERMINE            cerca in url, titolo e tag
+  tag NOME                  mostra i bookmark con quel tag
+  tag-add INDICE tag1,tag2  aggiunge uno o più tag a un bookmark
+  tag-rm INDICE tag1,tag2   toglie uno o più tag da un bookmark
+  tags                      elenca tutti i tag con il conteggio
+  cats                      elenca le categorie (file .txt)
+  open INDICE               apre il bookmark nel browser
+  edit INDICE               modifica il bookmark con \$EDITOR
+  mv INDICE CATEGORIA       sposta il bookmark in un'altra categoria
+  del INDICE                elimina il bookmark
+  sort [categoria]          ordina alfabeticamente i bookmark di ogni
+                            categoria (o solo di quella indicata)
+  check                     segnala i link non più raggiungibili
+  export                    esporta in HTML (importabile nei browser)
+  import FILE [-c cat]      importa da un file HTML del browser o da un file
+                            di testo (.txt) con un indirizzo per riga
+  tui                       apre l'interfaccia interattiva
+  path                      mostra dove sono salvati i file
+  help                      mostra questo aiuto
+
+L'INDICE è il numero mostrato da 'list' / 'search'.
+La cartella del database si cambia con la variabile BM_DIR.
+EOF
+}
+
+main() {
+    init_db
+    if [[ $# -eq 0 ]]; then
+        if [[ -t 0 && -t 1 ]]; then tui; else cmd_list; fi
+        return
+    fi
+    local cmd="$1"; shift
+    case "$cmd" in
+        add|a)          cmd_add "$@" ;;
+        list|ls|l)      cmd_list "$@" ;;
+        search|s|find)  cmd_search "$@" ;;
+        tag)            cmd_tag "$@" ;;
+        tag-add|tagadd) cmd_tag_add "$@" ;;
+        tag-rm|tagrm)   cmd_tag_rm "$@" ;;
+        tags)           cmd_tags ;;
+        cats|categorie) cmd_cats ;;
+        open|o)         cmd_open "$@" ;;
+        edit|e)         cmd_edit "$@" ;;
+        mv|move)        cmd_mv "$@" ;;
+        del|rm|delete)  cmd_del "$@" ;;
+        sort|ordina)    cmd_sort "$@" ;;
+        check)          cmd_check ;;
+        export)         cmd_export ;;
+        import)         cmd_import "$@" ;;
+        tui|t)          tui ;;
+        path|dir)       echo "$BM_DIR" ;;
+        help|-h|--help) usage ;;
+        *) echo "Comando sconosciuto: $cmd" >&2; usage; exit 1 ;;
+    esac
+}
+
+main "$@"
